@@ -1,0 +1,335 @@
+name: Code Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1. 程式碼風格 + 靜態分析（全專案 .py 檔）
+  # ─────────────────────────────────────────────────────────────
+  lint:
+    name: 程式碼風格與靜態分析
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: 取得原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安裝檢查工具
+        run: |
+          pip install flake8 pylint bandit
+
+      - name: Flake8 風格檢查（全專案）
+        run: |
+          flake8 . \
+            --exclude=.git,__pycache__,.venv,venv \
+            --max-line-length=120 \
+            --statistics \
+            --count \
+            --show-source \
+            --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s'
+
+      - name: Pylint 靜態分析（全專案）
+        run: |
+          pylint $(find . -name "*.py" \
+            -not -path "./.git/*" \
+            -not -path "./__pycache__/*" \
+            -not -path "./.venv/*" \
+            -not -path "./venv/*") \
+            --fail-under=7.0 \
+            --output-format=colorized \
+            --disable=C0114,C0115,C0116 \
+            --max-line-length=120
+
+      - name: Bandit 安全掃描（嚴格模式）
+        run: |
+          pip install bandit[toml]
+          # 輸出 JSON 供 artifact
+          bandit -r . \
+            --exclude .git,__pycache__,.venv,venv,tests \
+            -f json \
+            -o bandit-report.json || true
+          # 嚴格模式：medium severity + medium confidence 以上皆視為失敗
+          bandit -r . \
+            --exclude .git,__pycache__,.venv,venv,tests \
+            --severity-level medium \
+            --confidence-level medium \
+            -f txt
+
+      - name: 上傳 Bandit 報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+          retention-days: 30
+
+      - name: Bandit 結果寫入 Job Summary
+        if: always()
+        run: |
+          echo "## Bandit 安全掃描結果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f bandit-report.json ]; then
+            HIGH=$(python3 -c "import json,sys; d=json.load(open('bandit-report.json')); print(len([r for r in d.get('results',[]) if r['issue_severity']=='HIGH']))")
+            MEDIUM=$(python3 -c "import json,sys; d=json.load(open('bandit-report.json')); print(len([r for r in d.get('results',[]) if r['issue_severity']=='MEDIUM']))")
+            LOW=$(python3 -c "import json,sys; d=json.load(open('bandit-report.json')); print(len([r for r in d.get('results',[]) if r['issue_severity']=='LOW']))")
+            echo "| 嚴重程度 | 數量 |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔴 HIGH   | $HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🟡 MEDIUM | $MEDIUM |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔵 LOW    | $LOW |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. 相依套件弱點掃描
+  # ─────────────────────────────────────────────────────────────
+  dependency-audit:
+    name: 相依套件弱點掃描
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: 取得原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安裝套件
+        run: pip install -r requirements.txt
+
+      - name: pip-audit 弱點掃描
+        run: |
+          pip install pip-audit
+          pip-audit \
+            --requirement requirements.txt \
+            --format json \
+            --output pip-audit-report.json || true
+          # 顯示人類可讀版本，有漏洞時 exit 1
+          pip-audit \
+            --requirement requirements.txt \
+            --format columns
+
+      - name: 上傳 pip-audit 報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+          retention-days: 30
+
+      - name: pip-audit 結果寫入 Job Summary
+        if: always()
+        run: |
+          echo "## pip-audit 相依套件弱點掃描" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f pip-audit-report.json ]; then
+            COUNT=$(python3 -c "import json; d=json.load(open('pip-audit-report.json')); print(sum(len(p.get('vulns',[])) for p in d.get('dependencies',[])))")
+            echo "共發現 **$COUNT** 個已知漏洞（CVE）" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            python3 - <<'EOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          data = json.load(open("pip-audit-report.json"))
+          rows = []
+          for pkg in data.get("dependencies", []):
+              for vuln in pkg.get("vulns", []):
+                  rows.append(f"| {pkg['name']} {pkg['version']} | {vuln['id']} | {vuln.get('description','')[:80]} |")
+          if rows:
+              print("| 套件 | CVE | 說明 |")
+              print("|------|-----|------|")
+              for r in rows:
+                  print(r)
+          EOF
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # 3. 單元測試 + 覆蓋率（門檻 80%）
+  # ─────────────────────────────────────────────────────────────
+  test:
+    name: 單元測試與覆蓋率
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: 取得原始碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安裝套件
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      - name: 初始化測試資料庫
+        run: python init_db.py
+
+      - name: 執行測試與覆蓋率報告
+        run: |
+          python -m pytest tests/ -v \
+            --cov=. \
+            --cov-report=term-missing \
+            --cov-report=html:coverage-report \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80 \
+            --tb=short
+
+      - name: 上傳覆蓋率報告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage-report/
+            coverage.xml
+          retention-days: 30
+
+      - name: 覆蓋率結果寫入 Job Summary
+        if: always()
+        run: |
+          echo "## 測試覆蓋率報告" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage.xml ]; then
+            COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; t=ET.parse('coverage.xml').getroot(); print(f\"{float(t.attrib.get('line-rate',0))*100:.1f}\")")
+            echo "總覆蓋率：**${COVERAGE}%**（門檻：80%）" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. PR 變更摘要 + 安全模式偵測（留言到 PR）
+  # ─────────────────────────────────────────────────────────────
+  pr-summary:
+    name: PR 變更分析
+    runs-on: ubuntu-latest
+    needs: [lint, dependency-audit, test]
+    if: always()
+
+    permissions:
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: 取得原始碼
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 分析變更並留言
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            const pyFiles    = files.filter(f => f.filename.endsWith('.py'));
+            const htmlFiles  = files.filter(f => f.filename.endsWith('.html'));
+            const ymlFiles   = files.filter(f => f.filename.endsWith('.yml') || f.filename.endsWith('.yaml'));
+            const totalAdd   = files.reduce((s, f) => s + f.additions, 0);
+            const totalDel   = files.reduce((s, f) => s + f.deletions, 0);
+
+            // 安全模式偵測
+            const warnings = [];
+            const RISKY_PATTERNS = [
+              { re: /SECRET|PASSWORD|TOKEN|API_KEY|PRIVATE_KEY/i,   msg: '🔴 偵測到可能的敏感資訊關鍵字（SECRET / PASSWORD / TOKEN / KEY），請確認未硬編碼' },
+              { re: /db\.execute\([^,)]*[^?][^,)]*\)/,              msg: '🔴 `db.execute()` 可能未使用參數化查詢，請確認無 SQL Injection 風險' },
+              { re: /DEBUG\s*=\s*True/i,                            msg: '🟡 偵測到 `DEBUG = True`，請確認不會上到正式環境' },
+              { re: /eval\s*\(|exec\s*\(/,                          msg: '🔴 偵測到 `eval()` 或 `exec()`，可能有程式碼注入風險' },
+              { re: /subprocess\.call|os\.system/,                  msg: '🟡 偵測到系統指令執行，請確認輸入已驗證' },
+              { re: /pickle\.loads|yaml\.load\s*\([^,)]*\)/,        msg: '🔴 偵測到不安全的反序列化呼叫（pickle.loads / yaml.load）' },
+            ];
+
+            for (const file of files) {
+              for (const { re, msg } of RISKY_PATTERNS) {
+                if (file.patch && re.test(file.patch)) {
+                  warnings.push(`${msg}\n  → \`${file.filename}\``);
+                }
+              }
+            }
+
+            // 組裝 PR 留言
+            let body = `## 📊 Code Review 自動摘要\n\n`;
+
+            // 各 job 結果
+            const jobs = [
+              { name: '程式碼風格與靜態分析', result: '${{ needs.lint.result }}' },
+              { name: '相依套件弱點掃描',   result: '${{ needs.dependency-audit.result }}' },
+              { name: '單元測試與覆蓋率',   result: '${{ needs.test.result }}' },
+            ];
+            const icon = r => r === 'success' ? '✅' : r === 'failure' ? '❌' : r === 'skipped' ? '⏭️' : '⚠️';
+            body += `### CI 結果\n\n| 檢查項目 | 結果 |\n|----------|------|\n`;
+            for (const j of jobs) body += `| ${j.name} | ${icon(j.result)} ${j.result} |\n`;
+            body += `\n`;
+
+            // 變更統計
+            body += `### 變更統計\n\n`;
+            body += `| 類別 | 數量 |\n|------|------|\n`;
+            body += `| 變更檔案 | ${files.length} 個 |\n`;
+            body += `| Python 檔案 | ${pyFiles.length} 個 |\n`;
+            body += `| 模板檔案（HTML）| ${htmlFiles.length} 個 |\n`;
+            body += `| Workflow 檔案 | ${ymlFiles.length} 個 |\n`;
+            body += `| 新增行數 | +${totalAdd} |\n`;
+            body += `| 刪除行數 | -${totalDel} |\n\n`;
+
+            // 安全提醒
+            if (warnings.length > 0) {
+              body += `### 🚨 安全模式偵測\n\n${warnings.join('\n\n')}\n\n`;
+            } else {
+              body += `### ✅ 安全模式偵測：未發現高風險模式\n\n`;
+            }
+
+            // 變更清單
+            body += `### 📁 變更清單\n\n`;
+            const statusIcon = s => s === 'added' ? '🆕' : s === 'removed' ? '🗑️' : s === 'renamed' ? '🔀' : '📝';
+            for (const f of files) {
+              body += `- ${statusIcon(f.status)} \`${f.filename}\` (+${f.additions} / -${f.deletions})\n`;
+            }
+
+            body += `\n---\n_由 Code Review Workflow 自動產生 · ${new Date().toISOString()}_`;
+
+            // 更新或新增留言
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c => c.body.includes('Code Review 自動摘要'));
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
