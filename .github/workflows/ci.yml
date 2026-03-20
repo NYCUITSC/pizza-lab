@@ -65,3 +65,11 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
+          output: sarif-results
+
+      - name: 上傳 SARIF 報告（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ matrix.language }}-${{ github.run_number }}
+          path: sarif-results/
+          retention-days: 30
